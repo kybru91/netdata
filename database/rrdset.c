@@ -680,9 +680,18 @@ RRDSET *rrdset_create_custom(
         }
         if (mark_rebuild & (META_CHART_UPDATED | META_PLUGIN_UPDATED | META_MODULE_UPDATED)) {
             debug(D_METADATALOG, "CHART [%s] metadata updated", st->id);
-            int rc = update_chart_metadata(st->chart_uuid, st, id, name);
-            if (unlikely(rc))
-                error_report("Failed to update chart metadata in the database");
+
+            struct metadata_database_cmd cmd;
+            memset(&cmd, 0, sizeof(cmd));
+            cmd.opcode = METADATA_ADD_CHART;
+            rrd_atomic_fetch_add(&st->state->metadata_update_count, 1);
+            cmd.param[0] = st;
+            cmd.param[1] = (void *)strdupz(id);
+            cmd.param[2] = name ? (void *)strdupz(name) : NULL;
+            metadata_database_enq_cmd(&metasync_worker, &cmd);
+            //int rc = update_chart_metadata(st->chart_uuid, st, id, name);
+            //if (unlikely(rc))
+            //    error_report("Failed to update chart metadata in the database");
 
             if (!changed_from_archived_to_active) {
                 rrdset_flag_set(st, RRDSET_FLAG_SYNC_CLOCK);
@@ -900,15 +909,41 @@ RRDSET *rrdset_create_custom(
     rrdcalctemplate_link_matching(st);
 
     st->chart_uuid = find_chart_uuid(host, type, id, name);
-    if (unlikely(!st->chart_uuid))
-        st->chart_uuid = create_chart_uuid(st, id, name);
-    else
-        update_chart_metadata(st->chart_uuid, st, id, name);
 
-    store_active_chart(st->chart_uuid);
-    compute_chart_hash(st);
+    compute_chart_hash(st, 0);
 
+    if (unlikely(!st->chart_uuid)) {
+        //     st->chart_uuid = create_chart_uuid(st, id, name);
+        st->chart_uuid  = mallocz(sizeof(uuid_t));
+        uuid_generate(*st->chart_uuid);
+    }
+    rrd_atomic_fetch_add(&st->state->metadata_update_count, 1);
     rrdhost_unlock(host);
+
+    struct metadata_database_cmd cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.opcode = METADATA_ADD_CHART_FULL;
+    cmd.param[0] = st;
+    cmd.param[1] = (void *) strdupz(id);
+    cmd.param[2] = name ? (void *) strdupz(name) : NULL;
+    metadata_database_enq_cmd(&metasync_worker, &cmd);
+//        update_chart_metadata(st->chart_uuid, st, id, name);
+
+    //compute_chart_hash(st, 0);
+
+//    memset(&cmd, 0, sizeof(cmd));
+//    rrd_atomic_fetch_add(&st->state->metadata_update_count, 1);
+//    cmd.opcode = METADATA_ADD_CHART_ACTIVE;
+//    cmd.param[0] = st;
+//    metadata_database_enq_cmd(&metasync_worker, &cmd);
+//    rrd_atomic_fetch_add(&st->state->metadata_update_count, 1);
+//    cmd.opcode = METADATA_ADD_CHART_HASH;
+//    metadata_database_enq_cmd(&metasync_worker, &cmd);
+
+//    store_active_chart(st->chart_uuid);
+    //compute_chart_hash(st, 0);
+
+    //rrdhost_unlock(host);
 #ifdef ENABLE_ACLK
     if (netdata_cloud_setting)
         aclk_add_collector(host, plugin, module);
@@ -1871,7 +1906,8 @@ after_second_database_work:
             for (rd = st->dimensions, last = NULL; likely(rd);) {
                 if (unlikely(
                         rrddim_flag_check(rd, RRDDIM_FLAG_OBSOLETE) &&
-                        (rd->last_collected_time.tv_sec + rrdset_free_obsolete_time < now))) {
+                        (rd->last_collected_time.tv_sec + rrdset_free_obsolete_time < now) &&
+                        !rd->state->metadata_update_count)) {
                     info("Removing obsolete dimension '%s' (%s) of '%s' (%s).", rd->name, rd->id, st->name, st->id);
 
                     if (unlikely(
@@ -1920,13 +1956,20 @@ void rrdset_finalize_labels(RRDSET *st)
         replace_label_list(labels, new_labels);
     }
 
-    netdata_rwlock_rdlock(&labels->labels_rwlock);
-    struct label *lbl = labels->head;
-    while (lbl) {
-        sql_store_chart_label(st->chart_uuid, (int)lbl->label_source, lbl->key, lbl->value);
-        lbl = lbl->next;
-    }
-    netdata_rwlock_unlock(&labels->labels_rwlock);
+    struct metadata_database_cmd cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.opcode = METADATA_ADD_CHART_LABEL;
+    rrd_atomic_fetch_add(&st->state->metadata_update_count, 1);
+    cmd.param[0] = st;
+    metadata_database_enq_cmd(&metasync_worker, &cmd);
+
+//    netdata_rwlock_wrlock(&labels->labels_rwlock);
+//    struct label *lbl = labels->head;
+//    while (lbl) {
+//        sql_store_chart_label(st->chart_uuid, (int)lbl->label_source, lbl->key, lbl->value);
+//        lbl = lbl->next;
+//    }
+//    netdata_rwlock_unlock(&labels->labels_rwlock);
 
     st->state->new_labels = NULL;
 }
